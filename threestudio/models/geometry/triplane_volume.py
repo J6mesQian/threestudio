@@ -1,3 +1,4 @@
+# start here
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -11,11 +12,13 @@ from threestudio.utils.ops import get_activation
 from threestudio.utils.typing import *
 
 
-@threestudio.register("volume-grid")
-class VolumeGrid(BaseImplicitGeometry):
+@threestudio.register("triplane-volume")
+class TriplaneVolume(BaseImplicitGeometry):
     @dataclass
     class Config(BaseImplicitGeometry.Config):
-        grid_size: Tuple[int, int, int] = field(default_factory=lambda: (100, 100, 100))
+        # Size for each of the three feature planes
+        plane_resolution: Tuple[int, int] = field(default_factory=lambda: (256, 256))
+        # Total feature dimensions to store per plane
         n_feature_dims: int = 3
         density_activation: Optional[str] = "softplus"
         density_bias: Union[float, str] = "blob"
@@ -38,18 +41,33 @@ class VolumeGrid(BaseImplicitGeometry):
 
     def configure(self) -> None:
         super().configure()
-        self.grid_size = self.cfg.grid_size
-
-        self.grid = nn.Parameter(
-            torch.zeros(1, self.cfg.n_feature_dims + 1, *self.grid_size)
+        # Define the three planes (xy, xz, yz)
+        # Each plane stores density (1 channel) + features
+        # Dimensions are [batch, features, height, width]
+        n_dims_per_plane = self.cfg.n_feature_dims + 1
+        
+        # Create the three planes - each has density + feature channels
+        self.xy_plane = nn.Parameter(
+            torch.zeros(1, n_dims_per_plane, *self.cfg.plane_resolution)
         )
+        self.xz_plane = nn.Parameter(
+            torch.zeros(1, n_dims_per_plane, *self.cfg.plane_resolution)
+        )
+        self.yz_plane = nn.Parameter(
+            torch.zeros(1, n_dims_per_plane, *self.cfg.plane_resolution)
+        )
+        
+        # Define a scaling parameter for density
         if self.cfg.density_bias == "blob":
             self.register_buffer("density_scale", torch.tensor(0.0))
         else:
             self.density_scale = nn.Parameter(torch.tensor(0.0))
 
+        # If using predicted normals, we need three more planes for normal directions
         if self.cfg.normal_type == "pred":
-            self.normal_grid = nn.Parameter(torch.zeros(1, 3, *self.grid_size))
+            self.xy_normal_plane = nn.Parameter(torch.zeros(1, 3, *self.cfg.plane_resolution))
+            self.xz_normal_plane = nn.Parameter(torch.zeros(1, 3, *self.cfg.plane_resolution))
+            self.yz_normal_plane = nn.Parameter(torch.zeros(1, 3, *self.cfg.plane_resolution))
         
         # Initialize the MLP decoder if specified
         if self.cfg.use_feature_decoder:
@@ -80,7 +98,7 @@ class VolumeGrid(BaseImplicitGeometry):
 
     def get_density_bias(self, points: Float[Tensor, "*N Di"]):
         if self.cfg.density_bias == "blob":
-            # density_bias: Float[Tensor, "*N 1"] = self.cfg.density_blob_scale * torch.exp(-0.5 * (points ** 2).sum(dim=-1) / self.cfg.density_blob_std ** 2)[...,None]
+            # Similar to volume grid implementation
             density_bias: Float[Tensor, "*N 1"] = (
                 self.cfg.density_blob_scale
                 * (
@@ -95,17 +113,68 @@ class VolumeGrid(BaseImplicitGeometry):
         else:
             raise AttributeError(f"Unknown density bias {self.cfg.density_bias}")
 
-    def get_trilinear_feature(
-        self, points: Float[Tensor, "*N Di"], grid: Float[Tensor, "1 Df G1 G2 G3"]
-    ) -> Float[Tensor, "*N Df"]:
+    def sample_plane(
+        self, points: Float[Tensor, "*N 2"], plane: Float[Tensor, "1 C H W"]
+    ) -> Float[Tensor, "*N C"]:
+        """Sample features from a plane using bilinear interpolation"""
+        # points should be in range [-1, 1] for grid_sample
         points_shape = points.shape[:-1]
-        df = grid.shape[1]
-        di = points.shape[-1]
-        out = F.grid_sample(
-            grid, points.view(1, 1, 1, -1, di), align_corners=False, mode="bilinear"
+        c = plane.shape[1]
+        
+        # Reshape for grid_sample which expects 4D or 5D input
+        # Add batch dim and height dim (set to 1)
+        points_grid = points.view(1, 1, -1, 2)
+        
+        # Sample from the plane
+        sampled = F.grid_sample(
+            plane, points_grid, align_corners=False, mode="bilinear"
         )
-        out = out.reshape(df, -1).T.reshape(*points_shape, df)
-        return out
+        
+        # Reshape to match original shape
+        sampled = sampled.reshape(c, -1).T.reshape(*points_shape, c)
+        return sampled
+
+    def triplane_feature(
+        self, points: Float[Tensor, "*N 3"]
+    ) -> Float[Tensor, "*N C"]:
+        """Sample features from all three planes and combine them"""
+        # Extract 2D coordinates for each plane
+        xy_coords = points[..., :2]  # Extract x, y coordinates
+        xz_coords = torch.stack([points[..., 0], points[..., 2]], dim=-1)  # Extract x, z coordinates
+        yz_coords = points[..., 1:]  # Extract y, z coordinates
+
+        # Sample from each plane
+        xy_features = self.sample_plane(xy_coords, self.xy_plane)
+        xz_features = self.sample_plane(xz_coords, self.xz_plane)
+        yz_features = self.sample_plane(yz_coords, self.yz_plane)
+
+        # Combine features (sum or mean)
+        # Using sum as it's common in NeRF-like triplane implementations
+        features = xy_features + xz_features + yz_features
+        
+        return features
+
+    def triplane_normal(
+        self, points: Float[Tensor, "*N 3"]
+    ) -> Float[Tensor, "*N 3"]:
+        """Sample normal vectors from all three normal planes, if available"""
+        if self.cfg.normal_type != "pred":
+            raise ValueError("Normal planes are only used with normal_type='pred'")
+            
+        # Extract 2D coordinates for each plane
+        xy_coords = points[..., :2]  # Extract x, y coordinates
+        xz_coords = torch.stack([points[..., 0], points[..., 2]], dim=-1)  # Extract x, z coordinates
+        yz_coords = points[..., 1:]  # Extract y, z coordinates
+
+        # Sample from each normal plane
+        xy_normal = self.sample_plane(xy_coords, self.xy_normal_plane)
+        xz_normal = self.sample_plane(xz_coords, self.xz_normal_plane)
+        yz_normal = self.sample_plane(yz_coords, self.yz_normal_plane)
+
+        # Combine normal vectors
+        normal = xy_normal + xz_normal + yz_normal
+        
+        return normal
 
     def forward(
         self, points: Float[Tensor, "*N Di"], output_normal: bool = False
@@ -116,15 +185,18 @@ class VolumeGrid(BaseImplicitGeometry):
         )  # points normalized to (0, 1)
         points = points * 2 - 1  # convert to [-1, 1] for grid sample
 
-        out = self.get_trilinear_feature(points, self.grid)
+        # Get features from triplane representation
+        out = self.triplane_feature(points)
         density, features = out[..., 0:1], out[..., 1:]
-        density = density * torch.exp(self.density_scale)  # exp scaling in DreamFusion
+        
+        # Apply density scaling
+        density = density * torch.exp(self.density_scale)  # exp scaling like in DreamFusion
 
         # Apply MLP decoder to features if specified
         if self.cfg.use_feature_decoder and hasattr(self, 'feature_decoder'):
             features = self.feature_decoder(features)
 
-        # breakpoint()
+        # Apply density activation with bias
         density = get_activation(self.cfg.density_activation)(
             density + self.get_density_bias(points_unscaled)
         )
@@ -175,11 +247,12 @@ class VolumeGrid(BaseImplicitGeometry):
                     normal = -(density_offset[..., 0::1, 0] - density) / eps
                 normal = F.normalize(normal, dim=-1)
             elif self.cfg.normal_type == "pred":
-                normal = self.get_trilinear_feature(points, self.normal_grid)
+                normal = self.triplane_normal(points)
                 normal = F.normalize(normal, dim=-1)
             else:
                 raise AttributeError(f"Unknown normal type {self.cfg.normal_type}")
             output.update({"normal": normal, "shading_normal": normal})
+        
         return output
 
     def forward_density(self, points: Float[Tensor, "*N Di"]) -> Float[Tensor, "*N 1"]:
@@ -187,19 +260,24 @@ class VolumeGrid(BaseImplicitGeometry):
         points = contract_to_unisphere(points_unscaled, self.bbox, self.unbounded)
         points = points * 2 - 1  # convert to [-1, 1] for grid sample
 
-        out = self.get_trilinear_feature(points, self.grid)
-        density = out[..., 0:1]
+        # Sample from triplane to get density
+        out = self.triplane_feature(points)
+        density = out[..., 0:1]  # Just extract density channel
+        
+        # Apply density scaling
         density = density * torch.exp(self.density_scale)
 
+        # Apply density activation with bias
         density = get_activation(self.cfg.density_activation)(
             density + self.get_density_bias(points_unscaled)
         )
+        
         return density
 
     def forward_field(
         self, points: Float[Tensor, "*N Di"]
     ) -> Tuple[Float[Tensor, "*N 1"], Optional[Float[Tensor, "*N 3"]]]:
-        if self.cfg.isosurface_deformable_grid:
+        if getattr(self.cfg, "isosurface_deformable_grid", False):
             threestudio.warn(
                 f"{self.__class__.__name__} does not support isosurface_deformable_grid. Ignoring."
             )
@@ -215,10 +293,13 @@ class VolumeGrid(BaseImplicitGeometry):
         out: Dict[str, Any] = {}
         if self.cfg.n_feature_dims == 0:
             return out
+            
         points_unscaled = points
         points = contract_to_unisphere(points, self.bbox, self.unbounded)
         points = points * 2 - 1  # convert to [-1, 1] for grid sample
-        features = self.get_trilinear_feature(points, self.grid)[..., 1:]
+        
+        # Get features from triplane
+        features = self.triplane_feature(points)[..., 1:]
         
         # Apply MLP decoder to features if specified
         if self.cfg.use_feature_decoder and hasattr(self, 'feature_decoder'):
